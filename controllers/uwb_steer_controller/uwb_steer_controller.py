@@ -53,6 +53,7 @@ class ControlMode:
     FORWARD = 2
     TURN_AROUND = 3
     AVOIDING_OBSTACLE = 4
+    SAFE_MODE = 5
 
 
 class UWBNavigationController:
@@ -99,6 +100,9 @@ class UWBNavigationController:
         self.current_speed_reduction = 0.0  # Current speed reduction (0.0 to 3.0)
         self.target_speed_reduction = 0.0   # Target speed reduction
         self.speed_change_rate = 0.05  # Rate of speed change per step
+        
+        # Safe mode settings
+        self.safe_mode_threshold = 120  # Number of obstacles to activate safe mode
         
         # Get robot and waypoint nodes
         self.robot_node = self.robot.getSelf()
@@ -213,7 +217,7 @@ class UWBNavigationController:
         """
         Advanced obstacle detection using LiDAR with sector-based path selection.
         Dynamically adjusts obstacle threshold based on number of front obstacles.
-        Returns: (obstacle_detected, best_navigation_angle_deg)
+        Returns: (obstacle_detected, best_navigation_angle_deg, total_obstacles)
         """
         if not self.lidar:
             return False, goal_angle_deg
@@ -303,7 +307,7 @@ class UWBNavigationController:
                 binary_map.append(0)  # Free space
         
         if not obstacle_detected:
-            return False, goal_angle_deg
+            return False, goal_angle_deg, 0
         
         # Step 2: Divide into 36 sectors (10 degrees each)
         num_sectors = 36
@@ -321,6 +325,9 @@ class UWBNavigationController:
                     free_count += 1
             raw_free_spaces.append(free_count)
         
+        # Calculate total obstacles
+        total_obstacles = sum(binary_map)
+        
         # Second pass: calculate weighted free space scores considering neighbors
         sector_scores = []
         for sector_idx in range(num_sectors):
@@ -333,14 +340,22 @@ class UWBNavigationController:
             right2 = raw_free_spaces[(sector_idx - 2) % num_sectors]   # i-2
             left3 = raw_free_spaces[(sector_idx + 3) % num_sectors]    # i+3
             right3 = raw_free_spaces[(sector_idx - 3) % num_sectors]   # i-3
+            left4 = raw_free_spaces[(sector_idx + 4) % num_sectors]    # i+4
+            right4 = raw_free_spaces[(sector_idx - 4) % num_sectors]   # i-4
+            left5 = raw_free_spaces[(sector_idx + 5) % num_sectors]    # i+5
+            right5 = raw_free_spaces[(sector_idx - 5) % num_sectors]   # i-5
             
             free_space_score = (current * 0.2 + 
-                              left1 * 0.15 + 
-                              right1 * 0.15 + 
-                              left2 * 0.15 + 
+                              left1 * 0.1 + 
+                              right1 * 0.1 + 
+                              left2 * 0.1 + 
                               right2 * 0.1 + 
                               left3 * 0.1 + 
-                              right3 * 0.1)
+                              right3 * 0.1 +
+                              left4 * 0.05 + 
+                              right4 * 0.05 + 
+                              left5 * 0.05 + 
+                              right5 * 0.05)
             
             # Calculate mid-angle of this sector (in degrees)
             # Sector 0 = 5°, Sector 1 = 15°, etc.
@@ -396,7 +411,7 @@ class UWBNavigationController:
         # Debug output (optional)
         if self.step_counter % (self.steps_per_second * 2) == 0:
             print(f"\n=== Obstacle Avoidance Debug ===")
-            print(f"Front Obstacles: {front_obstacles} | Threshold: {self.obstacle_threshold:.2f}m")
+            print(f"Front Obstacles: {front_obstacles} | Total Obstacles: {total_obstacles} | Threshold: {self.obstacle_threshold:.2f}m")
             print(f"Original Goal Angle: {goal_angle_deg:.1f}°")
             print(f"Best Sector: {best_sector['sector_idx']} (angle: {best_navigation_angle:.1f}°)")
             print(f"  Weighted Free Space Score: {best_sector['free_space_score']:.2f} (raw: {best_sector['raw_free_space']})")
@@ -416,7 +431,7 @@ class UWBNavigationController:
                 print("  |  ".join(totals))
                 print()
         
-        return True, best_navigation_angle
+        return True, best_navigation_angle, total_obstacles
     
     def avoid_obstacle(self, avoidance_angle_deg):
         """Execute obstacle avoidance maneuver using the best navigation angle"""
@@ -542,7 +557,7 @@ class UWBNavigationController:
             goal_angle = (math.degrees(turn_angle) + 360) % 360
             
             # Check for obstacles
-            obstacle_detected, avoidance_angle_deg = self.check_obstacles(goal_angle)
+            obstacle_detected, avoidance_angle_deg, total_obstacles = self.check_obstacles(goal_angle)
             
             # Check if anchor is behind
             anchor_is_behind = False
@@ -566,6 +581,14 @@ class UWBNavigationController:
                 print("\n>>> Obstacle cleared, resuming navigation <<<\n")
                 self.current_mode = self.pre_avoidance_mode
             
+            # Handle safe mode based on total obstacles
+            if total_obstacles > self.safe_mode_threshold and self.current_mode != ControlMode.SAFE_MODE:
+                print(f"\n!!! SAFE MODE ACTIVATED !!! Total obstacles: {total_obstacles} > {self.safe_mode_threshold}\n")
+                self.current_mode = ControlMode.SAFE_MODE
+            elif total_obstacles <= self.safe_mode_threshold and self.current_mode == ControlMode.SAFE_MODE:
+                print(f"\n>>> SAFE MODE DEACTIVATED !!! Total obstacles: {total_obstacles} <= {self.safe_mode_threshold}\n")
+                self.current_mode = ControlMode.TURN_IN_PLACE
+            
             # Handle turn-around mode
             if self.current_mode == ControlMode.TURN_AROUND:
                 self.turn_around_counter += 1
@@ -578,8 +601,8 @@ class UWBNavigationController:
                     self.current_mode = ControlMode.TURN_AROUND
                     self.turn_around_counter = 0
             
-            # State machine for normal navigation (only if not avoiding or turning around)
-            if self.current_mode not in [ControlMode.TURN_AROUND, ControlMode.AVOIDING_OBSTACLE]:
+            # State machine for normal navigation (only if not avoiding, turning around, or in safe mode)
+            if self.current_mode not in [ControlMode.TURN_AROUND, ControlMode.AVOIDING_OBSTACLE, ControlMode.SAFE_MODE]:
                 next_mode = self.current_mode
                 
                 if self.current_mode == ControlMode.TURN_IN_PLACE:
@@ -600,7 +623,7 @@ class UWBNavigationController:
                 
                 if next_mode != self.current_mode:
                     mode_names = ["TURN-IN-PLACE", "ARC STEERING", "FORWARD", 
-                                 "TURN-AROUND", "AVOIDING OBSTACLE"]
+                                 "TURN-AROUND", "AVOIDING OBSTACLE", "SAFE MODE"]
                     print(f"[MODE CHANGE] {mode_names[self.current_mode]} -> "
                           f"{mode_names[next_mode]} (dist_diff={dist_diff:.3f}m)")
                     self.current_mode = next_mode
@@ -618,7 +641,7 @@ class UWBNavigationController:
                 print(f"Goal Angle: {goal_angle:.1f} deg")
                 
                 mode_names = ["TURN-IN-PLACE", "ARC STEERING", "FORWARD", 
-                             "TURN-AROUND", "AVOIDING OBSTACLE"]
+                             "TURN-AROUND", "AVOIDING OBSTACLE", "SAFE MODE"]
                 print(f"Control Mode: {mode_names[self.current_mode]}")
                 
                 if obstacle_detected:
@@ -670,6 +693,9 @@ class UWBNavigationController:
                         self.differential_steer_arc(avoidance_angle_deg)
                     elif self.current_mode == ControlMode.TURN_AROUND:
                         self.turn_around(d_left, d_right)
+                    elif self.current_mode == ControlMode.SAFE_MODE:
+                        # In safe mode, only turn in place
+                        self.turn_in_place_smart(d_left, d_right)
                     elif self.current_mode == ControlMode.TURN_IN_PLACE:
                         self.turn_in_place_smart(d_left, d_right)
                     elif self.current_mode == ControlMode.ARC_STEERING:
